@@ -277,6 +277,34 @@ app.post('/connect/:userId', auth, async (req, res) => {
   res.json({ status: 'connecting' })
 })
 
+// Phone number pairing — alternative to QR for newer WhatsApp versions
+app.post('/pair/:userId', auth, async (req, res) => {
+  const { userId } = req.params
+  const { phone }  = req.body
+  if (!phone) return res.status(400).json({ error: 'phone required' })
+
+  let sess = sessions.get(userId)
+
+  // Start a fresh session if needed
+  if (!sess || ['disconnected','error','not_started'].includes(sess.status)) {
+    startSession(userId).catch(() => {})
+    await new Promise(r => setTimeout(r, 2500))
+    sess = sessions.get(userId)
+  }
+
+  if (!sess?.socket) return res.status(503).json({ error: 'Session not ready — try again in a moment' })
+
+  try {
+    const clean = phone.replace(/\D/g, '')
+    const code  = await sess.socket.requestPairingCode(clean)
+    console.log(`[${userId.slice(0,8)}] pairing code issued for ${clean}`)
+    res.json({ code, status: 'ok' })
+  } catch (err) {
+    console.error(`[${userId.slice(0,8)}] pairing code error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 app.get('/qr/:userId', auth, (req, res) => {
   const sess = sessions.get(req.params.userId)
   if (!sess) return res.json({ status: 'not_started' })
