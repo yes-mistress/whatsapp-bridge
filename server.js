@@ -212,7 +212,7 @@ async function processOutbox(userId, socket) {
 async function startSession(userId) {
   const existing = sessions.get(userId)
   if (existing?.socket) { try { existing.socket.end() } catch (_) {} }
-  sessions.set(userId, { status: 'connecting', qr: null, phone: null, socket: null })
+  sessions.set(userId, { status: 'connecting', qr: null, phone: null, socket: null, pairCode: null })
 
   try {
     const { version }          = await fetchLatestBaileysVersion()
@@ -262,7 +262,7 @@ async function startSession(userId) {
     })
   } catch (err) {
     console.error(`[${userId.slice(0,8)}] startSession error:`, err.message)
-    sessions.set(userId, { status: 'error', qr: null, phone: null, socket: null })
+    sessions.set(userId, { status: 'error', qr: null, phone: null, socket: null, pairCode: null })
   }
 }
 
@@ -277,40 +277,92 @@ app.post('/connect/:userId', auth, async (req, res) => {
   res.json({ status: 'connecting' })
 })
 
-// Phone number pairing — alternative to QR for newer WhatsApp versions
-app.post('/pair/:userId', auth, async (req, res) => {
+// Phone number pairing — fires async so Vercel doesn't timeout waiting
+app.post('/pair/:userId', auth, (req, res) => {
   const { userId } = req.params
   const { phone }  = req.body
   if (!phone) return res.status(400).json({ error: 'phone required' })
+  const clean = phone.replace(/\D/g, '')
+  startPairingSession(userId, clean)  // fire-and-forget; client polls /qr for the code
+  res.json({ status: 'pairing_started' })
+})
 
-  let sess = sessions.get(userId)
-
-  // Start a fresh session if needed
-  if (!sess || ['disconnected','error','not_started'].includes(sess.status)) {
-    startSession(userId).catch(() => {})
-    await new Promise(r => setTimeout(r, 2500))
-    sess = sessions.get(userId)
-  }
-
-  if (!sess?.socket) return res.status(503).json({ error: 'Session not ready — try again in a moment' })
+// Kick off a new Baileys socket and request a pairing code asynchronously
+async function startPairingSession(userId, phone) {
+  const existing = sessions.get(userId)
+  if (existing?.socket) { try { existing.socket.end() } catch (_) {} }
+  sessions.set(userId, { status: 'connecting', qr: null, phone: null, socket: null, pairCode: null })
 
   try {
-    const clean = phone.replace(/\D/g, '')
-    const code  = await sess.socket.requestPairingCode(clean)
-    console.log(`[${userId.slice(0,8)}] pairing code issued for ${clean}`)
-    res.json({ code, status: 'ok' })
+    // Clear any saved auth so we start the registration flow fresh
+    await db.from('wa_sessions').delete().eq('user_id', userId)
+
+    const { version }          = await fetchLatestBaileysVersion()
+    const { state, saveCreds } = await makeSupabaseAuthState(userId)
+
+    const socket = makeWASocket({
+      version, auth: { creds: state.creds, keys: state.keys },
+      logger, browser: ['SWCRM', 'Chrome', '3.0'], markOnlineOnConnect: false,
+    })
+
+    sessions.get(userId).socket = socket
+    socket.ev.on('creds.update', saveCreds)
+
+    socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      const sess = sessions.get(userId)
+      if (!sess) return
+      if (qr) { sess.qr = qr; sess.status = 'qr_pending'; console.log(`[${userId.slice(0,8)}] QR ready (pairing mode)`) }
+      if (connection === 'open') {
+        sess.status = 'connected'; sess.qr = null; sess.pairCode = null
+        sess.phone = socket.user?.id ? jidToPhone(socket.user.id) : null
+        console.log(`[${userId.slice(0,8)}] Connected (paired) — ${sess.phone}`)
+        await db.from('whatsapp_config')
+          .update({ status: 'connected', connection_type: 'bridge', connected_at: new Date().toISOString() })
+          .eq('user_id', userId)
+        if (sess._outboxInterval) clearInterval(sess._outboxInterval)
+        sess._outboxInterval = setInterval(() => {
+          const s = sessions.get(userId)
+          if (s?.socket && s.status === 'connected') processOutbox(userId, s.socket)
+        }, 1500)
+      }
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode
+        const sess = sessions.get(userId)
+        if (sess) { clearInterval(sess._outboxInterval); sess.status = code === DisconnectReason.loggedOut ? 'disconnected' : 'reconnecting'; sess.socket = null }
+        if (code !== DisconnectReason.loggedOut) {
+          setTimeout(() => startSession(userId), 5000)
+        } else {
+          await db.from('wa_sessions').delete().eq('user_id', userId)
+          await db.from('whatsapp_config').update({ status: 'disconnected', connection_type: 'meta' }).eq('user_id', userId)
+        }
+      }
+    })
+
+    socket.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return
+      for (const msg of messages) await saveMessage(userId, msg)
+    })
+
+    // requestPairingCode internally waits for WS to connect, then fetches the code
+    const code = await socket.requestPairingCode(phone)
+    const sess = sessions.get(userId)
+    if (sess) { sess.pairCode = code; sess.status = 'qr_pending' }
+    console.log(`[${userId.slice(0,8)}] Pairing code ready for ${phone}`)
   } catch (err) {
-    console.error(`[${userId.slice(0,8)}] pairing code error:`, err.message)
-    res.status(500).json({ error: err.message })
+    console.error(`[${userId.slice(0,8)}] startPairingSession error:`, err.message)
+    const sess = sessions.get(userId)
+    if (sess) { sess.status = 'error'; sess.pairCode = null }
   }
-})
+}
 
 app.get('/qr/:userId', auth, (req, res) => {
   const sess = sessions.get(req.params.userId)
   if (!sess) return res.json({ status: 'not_started' })
   if (sess.status === 'connected') return res.json({ status: 'connected', phone: sess.phone })
-  if (sess.qr) return res.json({ status: 'qr_pending', qr: sess.qr })
-  res.json({ status: sess.status })
+  const out = { status: sess.status }
+  if (sess.qr)       out.qr       = sess.qr
+  if (sess.pairCode) out.pairCode  = sess.pairCode
+  res.json(out)
 })
 
 app.get('/status/:userId', auth, (req, res) => {
