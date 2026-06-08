@@ -287,14 +287,16 @@ app.post('/pair/:userId', auth, (req, res) => {
   res.json({ status: 'pairing_started' })
 })
 
-// Kick off a new Baileys socket and request a pairing code asynchronously
+// Kick off a new Baileys socket and request a pairing code asynchronously.
+// requestPairingCode MUST be called inside the 'qr' event — that's when WhatsApp's
+// server has opened the pairing window. Calling it before the event races the WS.
 async function startPairingSession(userId, phone) {
   const existing = sessions.get(userId)
   if (existing?.socket) { try { existing.socket.end() } catch (_) {} }
   sessions.set(userId, { status: 'connecting', qr: null, phone: null, socket: null, pairCode: null })
 
   try {
-    // Clear any saved auth so we start the registration flow fresh
+    // Clear any saved auth so we always start the registration flow fresh
     await db.from('wa_sessions').delete().eq('user_id', userId)
 
     const { version }          = await fetchLatestBaileysVersion()
@@ -308,10 +310,30 @@ async function startPairingSession(userId, phone) {
     sessions.get(userId).socket = socket
     socket.ev.on('creds.update', saveCreds)
 
+    let pairingRequested = false
+
     socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
       const sess = sessions.get(userId)
       if (!sess) return
-      if (qr) { sess.qr = qr; sess.status = 'qr_pending'; console.log(`[${userId.slice(0,8)}] QR ready (pairing mode)`) }
+
+      // When WhatsApp sends a QR challenge the pairing window is open.
+      // Request the phone-number code at this exact moment (only once).
+      if (qr && !pairingRequested) {
+        pairingRequested = true
+        sess.status = 'qr_pending'
+        console.log(`[${userId.slice(0,8)}] QR window open — requesting pairing code for ${phone}`)
+        try {
+          const code = await socket.requestPairingCode(phone)
+          const s = sessions.get(userId)
+          if (s) { s.pairCode = code }
+          console.log(`[${userId.slice(0,8)}] Pairing code ready: ${code}`)
+        } catch (err) {
+          console.error(`[${userId.slice(0,8)}] requestPairingCode error:`, err.message)
+          const s = sessions.get(userId)
+          if (s) s.status = 'error'
+        }
+      }
+
       if (connection === 'open') {
         sess.status = 'connected'; sess.qr = null; sess.pairCode = null
         sess.phone = socket.user?.id ? jidToPhone(socket.user.id) : null
@@ -325,10 +347,11 @@ async function startPairingSession(userId, phone) {
           if (s?.socket && s.status === 'connected') processOutbox(userId, s.socket)
         }, 1500)
       }
+
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode
-        const sess = sessions.get(userId)
-        if (sess) { clearInterval(sess._outboxInterval); sess.status = code === DisconnectReason.loggedOut ? 'disconnected' : 'reconnecting'; sess.socket = null }
+        const s = sessions.get(userId)
+        if (s) { clearInterval(s._outboxInterval); s.status = code === DisconnectReason.loggedOut ? 'disconnected' : 'reconnecting'; s.socket = null }
         if (code !== DisconnectReason.loggedOut) {
           setTimeout(() => startSession(userId), 5000)
         } else {
@@ -342,12 +365,6 @@ async function startPairingSession(userId, phone) {
       if (type !== 'notify') return
       for (const msg of messages) await saveMessage(userId, msg)
     })
-
-    // requestPairingCode internally waits for WS to connect, then fetches the code
-    const code = await socket.requestPairingCode(phone)
-    const sess = sessions.get(userId)
-    if (sess) { sess.pairCode = code; sess.status = 'qr_pending' }
-    console.log(`[${userId.slice(0,8)}] Pairing code ready for ${phone}`)
   } catch (err) {
     console.error(`[${userId.slice(0,8)}] startPairingSession error:`, err.message)
     const sess = sessions.get(userId)
